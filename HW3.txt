@@ -1,0 +1,767 @@
+# Our project has been realized by using the FJestul World Cup Database, containing highly detailed information about all the Fifa World Cup tournament editions, spanning from the first one in 1930 to the last one in 2022.
+
+The migration phase of the original relational database from PostgreSQL to a NoSQL architecture was realized with MongoDB. To manage the collections, execute the aggregation pipelines, and visualize the data structures, we utilized MongoDB Compass.
+For every relational table we had in our SQL database, we created a corresponding, empty collection inside MongoDB. We then exported each individual table as a CSV file and imported it into its respective MongoDB collection. Regarding data modeling, we initially kept all 17 collections normalized. However, running complex lookups caused severe performance problems and system timeouts. To resolve this, we optimized the structure by building shared Aggregate Tables that serve multiple queries at once, but we intentionally left Query 2 and Query 6 running on direct lookups. This allowed us to compare pre-aggregated performance against real-time computation.
+
+_______________________________________________________________________________________________________________________________________________________________________
+# QUERY 1: TOP-RANKED PLAYERS BY HISTORICAL WORLD CUP APPEARANCES
+
+### To run our first query without the computational problems related to the abuse of the $lookup operator, we pre-built the player_analytics_master aggregate table, which we also reused for queries 3 and 4.
+### player_analytics_master is the central denormalised collection of our project. Each document represents a single player appearance in a single match, and brings together data from four source collections: player_appearances forms the base, enriched with team names from teams, biographical data (given name and family name) from players, the player's registered position from squads, and match details such as the stage name and the final score from matches. This aggregate table is used by queries 1, 3, and 4.
+
+### Creation of aggregate table player_analytics_master
+
+db.player_appearances.aggregate([
+  // team info
+  {
+    $lookup: {
+      from: "teams",
+      localField: "team_id",
+      foreignField: "team_id",
+      as: "team_info"
+    }
+  },
+  { $unwind: "$team_info" },
+
+  // player biografical data
+  {
+    $lookup: {
+      from: "players",
+      localField: "player_id",
+      foreignField: "player_id",
+      as: "player_info"
+    }
+  },
+  { $unwind: "$player_info" },
+
+  // role/position of the player
+  {
+    $lookup: {
+      from: "squads",
+      let: { p_id: "$player_id", t_id: "$tournament_id" },
+      pipeline: [
+        { 
+          $match: { 
+            $expr: { 
+              $and: [ 
+                { $eq: ["$player_id", "$$p_id"] }, 
+                { $eq: ["$tournament_id", "$$t_id"] } 
+              ] 
+            } 
+          } 
+        }
+      ],
+      as: "squad_info"
+    }
+  },
+  { $unwind: { path: "$squad_info", preserveNullAndEmptyArrays: true } },
+
+  // Match details
+  {
+    $lookup: {
+      from: "matches",
+      localField: "match_id",
+      foreignField: "match_id",
+      as: "match_info"
+    }
+  },
+  { $unwind: "$match_info" },
+  {
+    $project: {
+      _id: 1,
+      tournament_id: 1,
+      match_id: 1,
+      team_id: 1,
+      team_name: "$team_info.team_name",
+      player_id: 1,
+      given_name: "$player_info.given_name",
+      family_name: "$player_info.family_name",
+      position_name: { $ifNull: ["$squad_info.position_name", "unknown"] },
+      stage_name: "$match_info.stage_name",
+      is_home: { $eq: ["$match_info.home_team_id", "$team_id"] },
+      home_score: "$match_info.home_team_score",
+      away_score: "$match_info.away_team_score"
+    }
+  },
+  { $out: "player_analytics_master" }
+]);
+
+
+
+# Query 1 pipeline: executed in the player_analytics_master aggregate table. We open the pipeline with a grouping stage to aggregate the data stream by player and team, instantly incrementing a counter for each record and fetching personal details cleanly via a first-occurrence accumulator. Then, we pass this into a sorting stage to arrange the accumulated totals in descending order, generating our final leaderboard from highest to lowest. 
+
+
+[
+  {
+    $group: {
+      _id: { player_id: "$player_id", team: "$team_name" },
+      given_name: { $first: "$given_name" },
+      family_name: { $first: "$family_name" },
+      total_presences: { $sum: 1 }
+    }
+  },
+  { $sort: { total_presences: -1 } }
+]
+
+
+############################################################################################
+
+## QUERY 2: MOST ENTERTAINING TOURNAMENTS BY AVERAGE GOALS PER MATCH
+
+# Query 2 pipeline: executed in the matches collection. This is one of the two queries of our project for which we didn't use a pre-built aggregate table. We did that because we wanted to analyze the difference in performance between the queries with or without the $lookup operator, so in this case we're using the $lookup.  
+
+Briefly, we open the pipeline by fetching the goals for each match and immediately use an array-size operator to count them. Next, we enter a grouping stage to compute the overall tournament averages using a standard mean accumulator. From there, we pass the data into a filtering stage to keep only tournaments above the 2.5 threshold, followed by a sorting stage to rank them in descending order, concluding with a clean projection of the tournament names.
+
+
+[
+  {
+    $lookup: {
+      from: "goals",
+      localField: "match_id",
+      foreignField: "match_id",
+      as: "goals_list"
+    }
+  },
+  {
+    $addFields: {
+      goals_in_match: {
+        $size: "$goals_list"
+      }
+    }
+  },
+  {
+    $group: {
+      _id: "$tournament_id",
+      avg_goals_per_match: {
+        $avg: "$goals_in_match"
+      }
+    }
+  },
+  {
+    $lookup: {
+      from: "tournaments",
+      localField: "_id",
+      foreignField: "tournament_id",
+      as: "tournament_info"
+    }
+  },
+  {
+    $unwind: {
+      path: "$tournament_info"
+    }
+  },
+  {
+    $match: {
+      avg_goals_per_match: {
+        $gt: 2.5
+      }
+    }
+  },
+  {
+    $sort: {
+      avg_goals_per_match: -1
+    }
+  },
+  {
+    $project: {
+      _id: 0,
+      tournament_name:
+        "$tournament_info.tournament_name",
+      avg_goals_per_match: 1
+    }
+  }
+]
+
+
+###############################################################################################
+
+## QUERY 3: NATIONAL TEAMS ELIMINATED EXCLUSIVELY IN THE GROUP STAGE
+
+# Query 3 pipeline: executed in the previous discussed player_analytics_master aggregate table
+
+We open the pipeline with a grouping stage to aggregate the records by team, using a unique set accumulator to compile a distinct list of all tournament phases each country has ever reached. Immediately after, we move into a filtering stage that evaluates this list, keeping only the teams whose historical phase array is strictly equal to just the group stage. Finally, we pass this stream into a projection and a sorting stage.
+
+[
+  {
+    $group: {
+      _id: "$team_id",
+      team_name: { $first: "$team_name" },
+      stages_played: { $addToSet: "$stage_name" }
+    }
+  },
+  {
+    $match: {
+      stages_played: { $eq: ["group stage"] }
+    }
+  },
+  { $project: { _id: 0, team_name: 1 } },
+  { $sort: { team_name: 1 } }
+]
+
+
+
+
+##############################################################################################
+
+## QUERY 4: MULTI-NATIONAL HISTORICAL FOOTBALL PLAYERS
+
+# Query 4 pipeline: executed in the previous discussed player_analytics_master aggregate table
+
+Starting from the previous discussed aggregate table, the pipeline groups records by player and collects the set of unique team names each player appeared for. It then filters to keep only those with more than one distinct nation in the $match stage, which can be seen as the MongoDB equivalent of a HAVING clause in SQL. The final $reduce step concatenates the nation names into a readable, comma-separated string and then We've sorted the output by the number of different nations represented, in descending order.
+
+[
+  {
+    $group: {
+      _id: "$player_id",
+      given_name: { $first: "$given_name" },
+      family_name: { $first: "$family_name" },
+      unique_teams: { $addToSet: "$team_name" }
+    }
+  },
+  {
+    $project: {
+      _id: 0,
+      given_name: 1,
+      family_name: 1,
+      unique_teams: 1,
+      num_nations: { $size: "$unique_teams" }
+    }
+  },
+  { $match: { num_nations: { $gt: 1 } } },
+  {
+    $project: {
+      given_name: 1,
+      family_name: 1,
+      num_nations: 1,
+      nations: {
+        $reduce: {
+          input: "$unique_teams",
+          initialValue: "",
+          in: {
+            $cond: [
+              { $eq: ["$$value", ""] },
+              "$$this",
+              {
+                $concat: [
+                  "$$value",
+                  ", ",
+                  "$$this"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  { $sort: { num_nations: -1, family_name: 1 } }
+]
+
+
+
+
+##########################################################################################
+
+## QUERY 5: PENALTY SPOT SCORING PROFILE FOR FORWARDS
+
+# Query 5: to run this query we chose to previously build the forwards_goals_profile aggregate table.
+
+forwards_goals_profile starts from the goals collection (one document per goal scored) and enriches each record by joining with players to retrieve the scorer's biographical data, and with squads to get their registered position in that tournament. Only players listed as forwards are kept. The records are then grouped by player, producing two pre-computed counters for each: their total goals and, separately, how many of those came from the penalty spot.
+
+# Creation of the forwards_goals_profile aggregate table
+
+db.goals.aggregate([
+  // Uniamo con players per verificare l'anagrafica
+  {
+    $lookup: {
+      from: "players",
+      localField: "player_id",
+      foreignField: "player_id",
+      as: "p_info"
+    }
+  },
+  { $unwind: "$p_info" },
+  // Uniamo con squads per estrarre la posizione ricoperta in quel torneo
+  {
+    $lookup: {
+      from: "squads",
+      let: { p_id: "$player_id", tour_id: "$tournament_id" },
+      pipeline: [
+        { $match: { $expr: { $and: [ { $eq: ["$player_id", "$$p_id"] }, { $eq: ["$tournament_id", "$$tour_id"] } ] } } }
+      ],
+      as: "squad_info"
+    }
+  },
+  { $unwind: "$squad_info" },
+  // Filtriamo subito per tenere solo i "forward" (attaccanti)
+  { $match: { "squad_info.position_name": "forward" } },
+  // Grouping for player
+  {
+    $group: {
+      _id: "$player_id",
+      given_name: { $first: "$p_info.given_name" },
+      family_name: { $first: "$p_info.family_name" },
+      total_goals: { $sum: 1 },
+      penalty_goals: { $sum: { $cond: [ { $eq: ["$penalty", true] }, 1, 0 ] } }
+    }
+  },
+  { $out: "forwards_goals_profile" }
+])
+
+
+
+# Query 5 pipeline: executed in the forwards_goals_profile aggregate table
+
+The Query simply takes this pre-computed collection and calculates the penalty_percentage, calculated as penalty goals divided by total goals, multiplied by 100 and rounded to two decimal places using $round, $multiplying and $divide operators. Finally in the sort stage we’ve sorted the results by total goals descending, so the most prolific forwards appear at the top.
+
+[
+  {
+    $project: {
+      _id: 0,
+      given_name: 1,
+      family_name: 1,
+      total_goals: 1,
+      penalty_goals: 1,
+      penalty_percentage: {
+        $round: [
+          {
+            $multiply: [
+              {
+                $divide: [
+                  "$penalty_goals",
+                  "$total_goals"
+                ]
+              },
+              100
+            ]
+          },
+          2
+        ]
+      }
+    }
+  },
+  { $sort: { total_goals: -1 } }
+]
+
+
+
+
+##############################################################################
+
+## QUERY 6: TOP 20 HISTORICAL SCORERS OF LATE REGULATION AND STOPPING TIME GOALS
+
+# Query 6: This is the other query for which we chose to use a direct approach since we run it directly in the goals collection without using a pre-buit aggregate table. Because of this of course the query is less efficient, computationally speaking, than the other ones implemented in aggregate collections. This is because of the $lookup stage, in which a join between collections is computed and it takes some time to complete this operation.
+
+# Query 6 pipeline: executed in the goals collection
+
+The pipeline opens with a $match stage that filters only the goals we care about that is those scored either when regulation minute is greater than 90, or when the extra time is greater than 0.
+From there, a $group stage counts the late goals per player, producing a simple ranking. A $lookup then joins against the players collection to retrieve each player's name, which is not stored in the goals collection itself. Finally, the results are sorted descending, limited to the top 20, and projected considering first name, family name, and late goal count.
+This pipeline maps closely to a SQL pattern: a WHERE filter followed by a GROUP BY and COUNT(*), with a JOIN to resolve the player names.
+
+[
+  {
+    $match: {
+      $or: [
+        {
+          minute_regulation: {
+            $gt: 90
+          }
+        },
+        {
+          minute_stoppage: {
+            $gt: 0
+          }
+        }
+      ]
+    }
+  },
+  {
+    $group: {
+      _id: "$player_id",
+      late_goals: {
+        $sum: 1
+      }
+    }
+  },
+  {
+    $lookup: {
+      from: "players",
+      localField: "_id",
+      foreignField: "player_id",
+      as: "player_info"
+    }
+  },
+  {
+    $unwind: {
+      path: "$player_info"
+    }
+  },
+  {
+    $sort: {
+      late_goals: -1
+    }
+  },
+  {
+    $limit: 20
+  },
+  {
+    $project: {
+      _id: 0,
+      given_name: "$player_info.given_name",
+      family_name: "$player_info.family_name",
+      late_goals: 1
+    }
+  }
+]
+
+
+
+
+
+############################################################################
+
+## QUERY 7: TOURNAMENT ATTENDANCE MASTERS WITH 100% MATCH APPEARANCES
+
+# QUERY 7: to run this query we chose to previously build the player_tournament_attendance aggregate table.
+
+player_tournament_attendance starts from the squads collection (one document per player per Tournament) and enriches each record with two pre-computed counts. The first, called expected, is drawn from team_appearances and represents how many matches that player's team played in that edition. The second, called actual, is drawn from player_appearances and counts how many of those matches the player personally appeared in. Biographical data, team names, and tournament names are also joined in from players, teams, and tournaments respectively
+
+
+# Creating the player_tournament_attendance aggregate table:
+
+// Starting from squads collection 
+db.squads.aggregate([
+  // counting how many matches the player's team played in a certain edition (expected count)
+  {
+    $lookup: {
+      from: "team_appearances",
+      let: { t_id: "$team_id", tour_id: "$tournament_id" },
+      pipeline: [
+        { $match: { $expr: { $and: [ { $eq: ["$team_id", "$$t_id"] }, { $eq: ["$tournament_id", "$$tour_id"] } ] } } },
+        { $count: "total_team_matches" }
+      ],
+      as: "team_matches"
+    }
+  },
+  { $unwind: { path: "$team_matches", preserveNullAndEmptyArrays: true } },
+ 
+  // counting the player appearances in a specific tournament edition (actual count)
+  {
+    $lookup: {
+      from: "player_appearances",
+      let: { p_id: "$player_id", tour_id: "$tournament_id" },
+      pipeline: [
+        { $match: { $expr: { $and: [ { $eq: ["$player_id", "$$p_id"] }, { $eq: ["$tournament_id", "$$tour_id"] } ] } } },
+        { $count: "actual_appearances" }
+      ],
+      as: "player_matches"
+    }
+  },
+  { $unwind: { path: "$player_matches", preserveNullAndEmptyArrays: true } },
+ 
+  // Retrieving biographical info, tournaments names and team info
+  { $lookup: { from: "players", localField: "player_id", foreignField: "player_id", as: "p" } },
+  { $lookup: { from: "teams", localField: "team_id", foreignField: "team_id", as: "t" } },
+  { $lookup: { from: "tournaments", localField: "tournament_id", foreignField: "tournament_id", as: "tr" } },
+  { $unwind: "$p" }, { $unwind: "$t" }, { $unwind: "$tr" },
+ 
+  {
+    $project: {
+      _id: 0,
+      family_name: "$p.family_name",
+      given_name: "$p.given_name",
+      team_name: "$t.team_name",
+      tournament_name: "$tr.tournament_name",
+      expected: { $ifNull: ["$team_matches.total_team_matches", 0] },
+      actual: { $ifNull: ["$player_matches.actual_appearances", 0] }
+    }
+  },
+  { $out: "player_tournament_attendance" }
+])
+
+
+
+# Query 7 pipeline: executed in the player_tournament_attendance aggregate table
+
+Query 7 then filters uses these pre-computed values and looks for records where actual count equals the expected one, and expected is greater than zero in the $match stage in order to retain those player who took part to all the matches played by their team in a certain edition.
+
+[
+  {
+    $match: {
+      $expr: { $and: [ { $gt: ["$expected", 0] }, { $eq: ["$actual", "$expected"] } ] }
+    }
+  },
+  { $project: { family_name: 1, given_name: 1, team_name: 1, tournament_name: 1 } }
+]
+
+
+
+
+
+###########################################################################################
+
+## QUERY 8: GOALKEEPER CLEAN SHEET
+
+# QUERY 8: to run this query we chose to previously build the goalkeeper_career_metrics aggregate table.
+
+goalkeeper_career_metrics starts from the squads collection filtered for goalkeepers only, and builds a career-level summary for each one by joining data from three collections. From player_appearances it counts the total number of World Cup matches the goalkeeper appeared in. From team_appearances we used player_appearances to confirm the goalkeeper was actually on the pitch and it counts the clean sheets, meaning matches where the opposing team's goals_against field is zero. Biographical data is joined in from players. The result is one document per goalkeeper, storing their total appearances and total clean sheets
+
+
+# Creation of goalkeeper_career_metrics aggregate table:
+
+db.squads.aggregate([
+  // filter to only retain goalkeepers
+  { $match: { position_name: "goal keeper" } },
+ 
+  // computing the total matches played by the gk
+  {
+    $lookup: {
+      from: "player_appearances",
+      localField: "player_id",
+      foreignField: "player_id",
+      as: "appearances"
+    }
+  },
+ 
+  // Computing clean sheets by checking those matches where opposite team scored 0 goals
+  {
+    $lookup: {
+      from: "team_appearances",
+      let: { p_id: "$player_id" },
+      pipeline: [
+        // Cerchiamo le apparizioni del portiere
+        {
+          $lookup: {
+            from: "player_appearances",
+            let: { m_id: "$match_id" },
+            pipeline: [
+              { $match: { $expr: { $and: [ { $eq: ["$match_id", "$$m_id"] }, { $eq: ["$player_id", "$$p_id"] } ] } } }
+            ],
+            as: "pa"
+          }
+        },
+        { $unwind: "$pa" },
+        { $match: { goals_against: 0 } }
+      ],
+      as: "clean_sheets"
+    }
+  },
+ 
+  { $lookup: { from: "players", localField: "player_id", foreignField: "player_id", as: "p" } },
+  { $unwind: "$p" },
+ 
+  {
+    $group: {
+      _id: "$player_id",
+      given_name: { $first: "$p.given_name" },
+      family_name: { $first: "$p.family_name" },
+      total_matches: { $first: { $size: "$appearances" } },
+      total_clean_sheets: { $first: { $size: "$clean_sheets" } }
+    }
+  },
+  { $out: "goalkeeper_career_metrics" }
+])
+
+	
+
+# QUERY 8: executed in goalkeeper_career_metrics aggregate table
+
+The query is run in the goalkeeper_career_metrics aggregate table which starts from the squads collection filtered for goalkeepers, and for each one it computes :
+1) the total number of World Cup matches the goalkeeper appeared in, drawn from player_appearances
+2) the number of those matches where the opposing team scored zero goals that is, clean sheets. To get this figure, we first look up the goalkeeper's individual appearances, and then for each appearance we look up the opposing team's score from team_appearances and we only counted matches where that score is zero
+The Query itself then takes this pre-materialised collection and computes the clean sheet percentage with the divide–multiply–round operators already seen in the query 5. In the sort stage then we’ve sorted the results alphabetically by family name.
+
+[
+  { $match: { total_matches: { $gt: 0 } } },
+  {
+    $project: {
+      _id: 0,
+      given_name: 1,
+      family_name: 1,
+      total_matches: 1,
+      total_clean_sheets: 1,
+      career_percentage: {
+        $round: [
+          {
+            $multiply: [
+              {
+                $divide: [
+                  "$total_clean_sheets",
+                  "$total_matches"
+                ]
+              },
+              100
+            ]
+          },
+          2
+        ]
+      }
+    }
+  },
+  { $sort: { family_name: 1 } }
+]
+
+#####################################################################################
+
+## QUERY 9: DOMINANT TEAM GOAL-CARRIERS WITH OVER 50% SCORING CONTRIBUTION
+
+# QUERY 9: to run this query we chose to previously build the player_vs_team_goals aggregate table.
+
+player_vs_team_goals starts from the goals collection and builds a specific tournament-level summary. It groups individual goals to count how many times a single player scored inside a specific tournament cycle for their national team. Then, through a nested lookup on the goals collection itself, it computes the overall total goals scored by that entire country during the same tournament. Additional biographical details and official names are joined in from players, teams, and tournaments. The result is a clean record for each player-team-tournament combination, storing individual player goals alongside the overall team goals.
+
+
+# Creation of player_vs_team_goals aggregate table:
+
+db.goals.aggregate([
+  // 1. Counting player's goal for each tournament
+  {
+    $group: {
+      _id: { player_id: "$player_id", team_id: "$team_id", tournament_id: "$tournament_id" },
+      player_goals: { $sum: 1 }
+    }
+  },
+  // 2. Computing the total goals done by that specific team in that specific tournament
+  {
+    $lookup: {
+      from: "goals",
+      let: { team_id: "$_id.team_id", tour_id: "$_id.tournament_id" },
+      pipeline: [
+        { $match: { $expr: { $and: [ { $eq: ["$team_id", "$$team_id"] }, { $eq: ["$tournament_id", "$$tour_id"] } ] } } },
+        { $count: "count" }
+      ],
+      as: "team_total"
+    }
+  },
+  { $unwind: "$team_total" },
+  { $lookup: { from: "players", localField: "_id.player_id", foreignField: "player_id", as: "p" } },
+  { $lookup: { from: "teams", localField: "_id.team_id", foreignField: "team_id", as: "t" } },
+  { $lookup: { from: "tournaments", localField: "_id.tournament_id", foreignField: "tournament_id", as: "tr" } },
+  { $unwind: "$p" }, { $unwind: "$t" }, { $unwind: "$tr" },
+  {
+    $project: {
+      _id: 0,
+      family_name: "$p.family_name",
+      team_name: "$t.team_name",
+      tournament_name: "$tr.tournament_name",
+      player_goals: 1,
+      total_team_goals: "$team_total.count"
+    }
+  },
+  { $out: "player_vs_team_goals" }
+])
+
+
+
+# QUERY 9: executed in player_vs_team_goals aggregate table
+
+We open the pipeline with a projection stage to dynamically compute a new field representing the rest of the team's goals, which is handled instantly by subtracting the player's personal goals from the pre-calculated team total. Immediately after, we move into a filtering stage that evaluates this calculation, keeping only the player documents where their personal goals are strictly greater than the rest of the team's combined scoring output. Finally, we pass these results into a sorting stage to organize our goal-carriers in descending order based on their tournament goals.
+
+[
+  {
+    $project: {
+      family_name: 1,
+      team_name: 1,
+      tournament_name: 1,
+      player_goals: 1,
+      total_team_goals: 1,
+      rest_of_team_goals: { $subtract: ["$total_team_goals", "$player_goals"] }
+    }
+  },
+  {
+    $match: {
+      $expr: { $gt: ["$player_goals", "$rest_of_team_goals"] }
+    }
+  },
+  { $sort: { player_goals: -1 } }
+]
+
+#####################################################################################
+
+## QUERY 10: HEAD TO HEAD HISTORICAL NATIONAL TEAMS 
+
+# QUERY 10: to run this query we chose to previously build the head_to_head_matches aggregate table.
+
+head_to_head_matches starts from the matches collection and simplifies the relational structure. It runs a lookup against the teams collection twice to resolve both the home team ID and the away team ID into clear, readable country names. After unwinding the joined data, it projects a simplified document layout storing only the main team names and their respective match scores. The result is a clean aggregate table where every single historical match is represented with flat string values, serving as a baseline for bidirectional processing.
+
+
+# Creation of head_to_head_matches aggregate table:
+
+db.matches.aggregate([
+  // "Join" to take the home team's name
+  { $lookup: { from: "teams", localField: "home_team_id", foreignField: "team_id", as: "home" } },
+  // "Join" to take the away team's name
+  { $lookup: { from: "teams", localField: "away_team_id", foreignField: "team_id", as: "away" } },
+  { $unwind: "$home" },
+  { $unwind: "$away" },
+  {
+    $project: {
+      _id: 0,
+      team: "$home.team_name",
+      opponent: "$away.team_name",
+      home_score: "$home_team_score",
+      away_score: "$away_team_score"
+    }
+  },
+  { $out: "head_to_head_matches" }
+])
+
+
+
+# QUERY 10: executed in head_to_head_matches aggregate table
+
+We open the pipeline using a parallel processing stage called a facet, which splits our matches into two independent streams. The first stream projects the match details from the home team's perspective, using conditional operations to flag wins, losses, or draws. The second stream completely flips the perspective to evaluate the exact same match from the visitor's point of view. Next, we enter a flattening and merging phase, where we combine these two parallel arrays and unwind them, effectively doubling our dataset to capture both angles of every game. From there, we pass the data into a grouping stage to aggregate the records by the final team-opponent pairs, summing up the total encounters simultaneously in a single pass. We conclude the pipeline with a sorting stage to organize the entire dashboard alphabetically by team, descending by total encounters, and alphabetically by opponent.
+
+
+[
+  // We duplicate the records to see them from both perspectives (Team A vs Team B e Team B vs Team A)
+  {
+    $facet: {
+      as_home: [
+        {
+          $project: {
+            team: "$team", opponent: "$opponent",
+            win: { $cond: [{ $gt: ["$home_score", "$away_score"]}, 1, 0] },
+            draw: { $cond: [{ $eq: ["$home_score", "$away_score"]}, 1, 0] },
+            loss: { $cond: [{ $lt: ["$home_score", "$away_score"]}, 1, 0] }
+          }
+        }
+      ],
+      as_away: [
+        {
+          $project: {
+            team: "$opponent", opponent: "$team",
+            win: { $cond: [{ $lt: ["$home_score", "$away_score"]}, 1, 0] },
+            draw: { $cond: [{ $eq: ["$home_score", "$away_score"]}, 1, 0] },
+            loss: { $cond: [{ $gt: ["$home_score", "$away_score"]}, 1, 0] }
+          }
+        }
+      ]
+    }
+  },
+  // COmbining
+  { $project: { all: { $concatArrays: ["$as_home", "$as_away"] } } },
+  { $unwind: "$all" },
+  { $replaceRoot: { newRoot: "$all" } },
+  // Grouping for pair 
+  {
+    $group: {
+      _id: { team: "$team", opponent: "$opponent" },
+      total_encounters: { $sum: 1 },
+      wins: { $sum: "$win" },
+      draws: { $sum: "$draw" },
+      losses: { $sum: "$loss" }
+    }
+  },
+  {
+    $project: {
+      _id: 0,
+      team: "$_id.team",
+      opponent: "$_id.opponent",
+      total_encounters: 1,
+      wins: 1,
+      draws: 1,
+      losses: 1
+    }
+  },
+  { $sort: { team: 1, total_encounters: -1, opponent: -1 } }
+]
